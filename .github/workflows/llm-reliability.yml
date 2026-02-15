@@ -1,0 +1,161 @@
+name: LLM Reliability Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model to evaluate"
+        required: true
+        type: choice
+        options:
+          - "bedrock (Claude Haiku 4.5)"
+          - "ollama (qwen2.5:3b)"
+
+permissions:
+  contents: write
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+
+    services:
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+        ports:
+          - 9200:9200
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        options: >-
+          --health-cmd "curl -f http://localhost:9200/_cluster/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      BEDROCK_INFERENCE_PROFILE_ID: ${{ secrets.BEDROCK_INFERENCE_PROFILE_ID }}
+      ES_HOST: http://localhost:9200
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set model config
+        id: config
+        run: |
+          if [[ "${{ inputs.model }}" == "ollama"* ]]; then
+            echo "config_file=.llm-reliability-ollama.yaml" >> $GITHUB_OUTPUT
+            echo "provider=ollama" >> $GITHUB_OUTPUT
+            echo "dims=256" >> $GITHUB_OUTPUT
+          else
+            echo "config_file=.llm-reliability-bedrock.yaml" >> $GITHUB_OUTPUT
+            echo "provider=bedrock" >> $GITHUB_OUTPUT
+            echo "dims=1024" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Ollama
+        if: steps.config.outputs.provider == 'ollama'
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          sleep 5
+          ollama pull qwen2.5:3b
+
+      - name: Set Ollama env vars
+        if: steps.config.outputs.provider == 'ollama'
+        run: |
+          echo "EVALUATOR_PROVIDER=ollama" >> $GITHUB_ENV
+          echo "OLLAMA_HOST=http://localhost:11434" >> $GITHUB_ENV
+          echo "EVALUATOR_MODEL_ID=qwen2.5:3b" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: pip install -e .
+
+      - name: Create ES index with mapping
+        run: |
+          curl -s -X PUT http://localhost:9200/trusted_docs -H 'Content-Type: application/json' -d '{
+            "mappings": {
+              "properties": {
+                "content": {"type": "text"},
+                "embedding": {
+                  "type": "dense_vector",
+                  "dims": ${{ steps.config.outputs.dims }},
+                  "index": true,
+                  "similarity": "cosine"
+                }
+              }
+            }
+          }'
+
+      - name: Ingest documents into Elasticsearch
+        run: |
+          python -c "
+          from src.ingest.pipeline import run_ingest
+          result = run_ingest('${{ steps.config.outputs.config_file }}')
+          print(f'Ingested {result[\"chunks_indexed\"]} chunks from {result[\"documents_processed\"]} docs')
+          "
+
+      - name: Start API server
+        run: uvicorn src.api:app --host 0.0.0.0 --port 8000 &
+
+      - name: Wait for server startup
+        run: |
+          for i in $(seq 1 30); do
+            curl -s http://localhost:8000/health && break
+            sleep 1
+          done
+
+      - name: "Evaluate: ${{ inputs.model }}"
+        run: |
+          curl -s -X POST http://localhost:8000/evaluate \
+            -H "Content-Type: application/json" \
+            -d '{"config_path": "${{ steps.config.outputs.config_file }}"}' \
+            -o result.json
+          cat result.json | python -m json.tool
+
+      - name: Decide and Update README
+        run: |
+          RISK=$(jq -r .hallucination_risk result.json)
+          SCORE=$(jq -r .reliability_score result.json)
+          DECISION=$(jq -r .decision result.json)
+          MODEL="${{ inputs.model }}"
+          echo "Model: $MODEL | Risk: $RISK | Score: $SCORE | Decision: $DECISION"
+
+          if [ "$DECISION" = "approve" ]; then
+            COLOR="green"
+          else
+            COLOR="red"
+          fi
+
+          BADGE="![LLM Reliability](https://img.shields.io/badge/reliability-${SCORE}-${COLOR})"
+
+          if grep -q '^\!\[LLM Reliability\]' README.md 2>/dev/null; then
+            sed -i "s|^!\[LLM Reliability\].*|${BADGE}|" README.md
+          else
+            echo "" >> README.md
+            echo "${BADGE}" >> README.md
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --cached --quiet || git commit -m "chore: update reliability badge [skip ci]"
+          git push || true
+
+      - name: Gate Decision
+        run: |
+          DECISION=$(jq -r .decision result.json)
+          if [ "$DECISION" = "reject" ]; then
+            echo "::error::LLM reliability gate REJECTED deployment (decision=$DECISION)"
+            exit 1
+          fi
+          echo "Gate passed with decision: $DECISION"
